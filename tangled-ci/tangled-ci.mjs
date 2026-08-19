@@ -6,7 +6,7 @@
 //
 // Usage:
 //   node tangled-ci.mjs login <handle-or-did> [--profile NAME]
-//   node tangled-ci.mjs trigger <workflow> [--owner <did>] [--sha <sha>] [--ref <ref>] [--host <url>] [--profile NAME]
+//   node tangled-ci.mjs trigger <workflow> [--owner <did>] [--repo <name>] [--sha <sha>] [--ref <ref>] [--host <url>] [--profile NAME]
 //   node tangled-ci.mjs whoami [--profile NAME]
 //   node tangled-ci.mjs list
 
@@ -73,6 +73,18 @@ function currentGitRef() {
     if (branch && branch !== 'HEAD') return `refs/heads/${branch}`;
   } catch {}
   return 'refs/heads/main';
+}
+
+function currentGitRepoName() {
+  try {
+    const remoteUrl = execFileSync('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8' }).trim();
+    // Strip trailing .git and take the last path segment: works for
+    // https://tangled.sh/owner/repo, git@host:owner/repo.git, etc.
+    const name = remoteUrl.replace(/\.git$/, '').split(/[/:]/).filter(Boolean).pop();
+    return name || null;
+  } catch {
+    return null;
+  }
 }
 
 // Resolve the knot server URL for a DID by fetching its DID document.
@@ -173,7 +185,7 @@ function cmdList() {
 async function cmdTrigger(args) {
   const workflow = args._[1];
   if (!workflow) {
-    console.error('Usage: tangled-ci.mjs trigger <workflow-name> [--owner <did>] [--sha <sha>] [--ref <ref>] [--host <url>] [--profile NAME]');
+    console.error('Usage: tangled-ci.mjs trigger <workflow-name> [--owner <did>] [--repo <name>] [--sha <sha>] [--ref <ref>] [--host <url>] [--profile NAME]');
     process.exit(1);
   }
 
@@ -237,7 +249,10 @@ async function cmdTrigger(args) {
   console.log(`\nPipeline queued: ${json?.pipeline ?? '(no AT-URI returned)'}`);
   if (json?.pipeline) {
     const pipelineId = json.pipeline.split('/').pop();
-    console.log(`  View at: https://tangled.org/${data.handle ?? ownerDid}/sleek/pipelines/${pipelineId}`);
+    const repoName = args.repo ?? currentGitRepoName();
+    if (repoName) {
+      console.log(`  View at: https://tangled.org/${data.handle ?? ownerDid}/${repoName}/pipelines/${pipelineId}`);
+    }
   }
 }
 
@@ -262,6 +277,7 @@ Commands:
 
 Options for 'trigger':
   --owner <did>    Repository DID (default: authenticated user's own DID)
+  --repo <name>    Repository slug for the view URL (default: auto-detected from git remote)
   --sha <sha>      Commit SHA to build (default: git rev-parse HEAD)
   --ref <ref>      Ref for display, e.g. refs/heads/main (default: current branch)
   --host <url>     Knot server base URL (default: profile's PDS)

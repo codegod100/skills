@@ -50,7 +50,7 @@ function log(...a) {
   console.error('[atproto-login]', ...a);
 }
 
-async function waitForCallback(server, expectedState, timeoutMs) {
+async function waitForCallback(server, expectedState, timeoutMs, { clientMetadataJson } = {}) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       server.close();
@@ -59,6 +59,14 @@ async function waitForCallback(server, expectedState, timeoutMs) {
 
     server.on('request', (req, res) => {
       const url = new URL(req.url, 'http://127.0.0.1');
+
+      // Serve the client metadata document when running in cloud/public-URL mode.
+      if (clientMetadataJson && (url.pathname === '/client-metadata.json' || url.pathname === '/')) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(clientMetadataJson);
+        return;
+      }
+
       if (url.pathname !== '/callback') {
         res.writeHead(404).end();
         return;
@@ -94,23 +102,67 @@ async function waitForCallback(server, expectedState, timeoutMs) {
 async function cmdLogin(args) {
   const identity = args._[1];
   if (!identity) {
-    console.error('Usage: atproto-login.mjs login <handle-or-did> [--profile NAME] [--scope "..."]');
+    console.error('Usage: atproto-login.mjs login <handle-or-did> [--profile NAME] [--scope "..."] [--paste-callback] [--public-url <url> --port <n>]');
     process.exit(1);
   }
   const profile = args.profile || 'default';
   const scope = args.scope || 'atproto transition:generic';
   const timeoutMs = Number(args.timeout || 300_000);
 
-  // 1. Start the local loopback listener first so we know our port.
-  const server = http.createServer();
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const port = server.address().port;
-  const redirectUri = `http://127.0.0.1:${port}/callback`;
+  // --paste-callback: OOB flow for cloud environments where the loopback server isn't reachable
+  // from the user's browser. Uses a fixed loopback redirect_uri (no server needed — the browser
+  // may show ERR_CONNECTION_REFUSED but the URL with the auth code is visible in the address bar).
+  // The user copies that URL and pastes it at the prompt.
+  const pasteCallback = !!args['paste-callback'];
 
-  const clientId = new URL('http://localhost/');
-  clientId.searchParams.set('redirect_uri', redirectUri);
-  clientId.searchParams.set('scope', scope);
-  const clientIdStr = clientId.toString();
+  // Cloud mode: --public-url <https://…> --port <n>
+  // The callback server is exposed via a public URL (e.g. Blocks-registered port).
+  // The ATProto AS fetches the client metadata document from <public-url>/client-metadata.json,
+  // so the server also serves that endpoint. The client_id IS the metadata URL per ATProto OAuth.
+  //
+  // Loopback mode (default): ephemeral port on 127.0.0.1, loopback client_id trick.
+  const publicUrl = args['public-url'] ? args['public-url'].replace(/\/$/, '') : null;
+
+  let server, listenPort, clientIdStr, redirectUri, clientMetadataJson;
+
+  if (pasteCallback) {
+    // OOB mode: no server, fixed loopback port just for the redirect_uri shape.
+    const fixedPort = Number(args.port || 8889);
+    redirectUri = `http://127.0.0.1:${fixedPort}/callback`;
+    const clientIdUrl = new URL('http://localhost/');
+    clientIdUrl.searchParams.set('redirect_uri', redirectUri);
+    clientIdUrl.searchParams.set('scope', scope);
+    clientIdStr = clientIdUrl.toString();
+    log(`OOB mode: redirect_uri=${redirectUri} (no local server — you will paste the callback URL)`);
+  } else if (publicUrl) {
+    const fixedPort = Number(args.port || 8889);
+    server = http.createServer();
+    await new Promise((resolve) => server.listen(fixedPort, '0.0.0.0', resolve));
+    listenPort = server.address().port;
+    redirectUri = `${publicUrl}/callback`;
+    clientIdStr = `${publicUrl}/client-metadata.json`;
+    clientMetadataJson = JSON.stringify({
+      client_id: clientIdStr,
+      client_uri: publicUrl,
+      redirect_uris: [redirectUri],
+      scope,
+      dpop_bound_access_tokens: true,
+      token_endpoint_auth_method: 'none',
+      grant_types: ['authorization_code', 'refresh_token'],
+      response_types: ['code'],
+      application_type: 'web',
+    });
+    log(`Cloud mode: listening on 0.0.0.0:${listenPort}, public URL: ${publicUrl}`);
+  } else {
+    server = http.createServer();
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    listenPort = server.address().port;
+    redirectUri = `http://127.0.0.1:${listenPort}/callback`;
+    const clientIdUrl = new URL('http://localhost/');
+    clientIdUrl.searchParams.set('redirect_uri', redirectUri);
+    clientIdUrl.searchParams.set('scope', scope);
+    clientIdStr = clientIdUrl.toString();
+  }
 
   log(`Resolving identity for ${identity}...`);
   const { did, pds, authServer, asMeta } = await resolveIdentity(identity, {
@@ -145,7 +197,7 @@ async function cmdLogin(args) {
     nonces,
   });
   if (!parRes.ok) {
-    server.close();
+    server?.close();
     throw new Error(`PAR request failed: HTTP ${parRes.status} ${await parRes.text()}`);
   }
   const { request_uri } = await parRes.json();
@@ -161,13 +213,43 @@ async function cmdLogin(args) {
   console.log('  ' + authorizeUrl.toString());
   console.log('');
 
-  // 4. Wait for the browser redirect back to our loopback server.
-  const { code, iss } = await waitForCallback(server, state, timeoutMs);
+  // 4. Complete the auth dance (callback or OOB save-state-and-exit).
+  if (pasteCallback) {
+    // Save pending auth state so `complete-login` can finish the exchange later.
+    const pendingPath = `${STORE_DIR}/${profile}.pending.json`;
+    fs.mkdirSync(STORE_DIR, { recursive: true });
+    fs.writeFileSync(pendingPath, JSON.stringify({
+      did, pds, authServer,
+      tokenEndpoint: asMeta.token_endpoint,
+      revocationEndpoint: asMeta.revocation_endpoint,
+      issuer: asMeta.issuer,
+      clientId: clientIdStr,
+      redirectUri,
+      scope,
+      codeVerifier,
+      dpopKeys,
+      nonces,
+      state,
+    }, null, 2), { mode: 0o600 });
+
+    console.log('After you authenticate, your browser will be redirected to a URL starting with:');
+    console.log(`  ${redirectUri}?code=...`);
+    console.log('');
+    console.log('The page may show ERR_CONNECTION_REFUSED — that is expected (nothing is listening locally).');
+    console.log('Copy the full URL from your browser address bar, then run:');
+    console.log('');
+    console.log(`  node atproto-login.mjs complete-login "<pasted-url>" --profile ${profile}`);
+    console.log('');
+    return;
+  }
+
+  let code, iss;
+  ({ code, iss } = await waitForCallback(server, state, timeoutMs, { clientMetadataJson }));
   if (iss && asMeta.issuer && iss !== asMeta.issuer) {
     throw new Error(`Issuer mismatch on callback: expected ${asMeta.issuer}, got ${iss}`);
   }
 
-  // 5. Exchange the code for DPoP-bound tokens.
+  // 5. Exchange the authorization code for DPoP-bound tokens.
   const tokenBody = new URLSearchParams({
     grant_type: 'authorization_code',
     code,
@@ -324,6 +406,82 @@ async function cmdCall(args) {
   console.log(typeof json === 'string' ? json : JSON.stringify(json, null, 2));
 }
 
+async function cmdCompleteLogin(args) {
+  const callbackUrl = args._[1];
+  if (!callbackUrl) {
+    console.error('Usage: atproto-login.mjs complete-login <callback-url> [--profile NAME]');
+    console.error('  Finish an OOB login started with: atproto-login.mjs login ... --paste-callback');
+    process.exit(1);
+  }
+  const profile = args.profile || 'default';
+  const pendingPath = `${STORE_DIR}/${profile}.pending.json`;
+  if (!fs.existsSync(pendingPath)) {
+    console.error(`No pending login for profile "${profile}". Run: atproto-login.mjs login <handle> --paste-callback --profile ${profile}`);
+    process.exit(1);
+  }
+  const pending = JSON.parse(fs.readFileSync(pendingPath, 'utf8'));
+
+  const cbUrl = new URL(callbackUrl);
+  const code = cbUrl.searchParams.get('code');
+  const returnedState = cbUrl.searchParams.get('state');
+  const iss = cbUrl.searchParams.get('iss');
+  const error = cbUrl.searchParams.get('error');
+
+  if (error) throw new Error(`Authorization server returned error: ${error}`);
+  if (returnedState !== pending.state) throw new Error('State mismatch — possible CSRF, aborting.');
+  if (!code) throw new Error('No code parameter found in the callback URL.');
+  if (iss && pending.issuer && iss !== pending.issuer) {
+    throw new Error(`Issuer mismatch: expected ${pending.issuer}, got ${iss}`);
+  }
+
+  const tokenBody = new URLSearchParams({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: pending.redirectUri,
+    code_verifier: pending.codeVerifier,
+    client_id: pending.clientId,
+  });
+  const tokenRes = await dpopFetch(pending.tokenEndpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: tokenBody.toString(),
+    dpopKeys: pending.dpopKeys,
+    nonces: pending.nonces,
+  });
+  const tokenJson = await tokenRes.json();
+  if (!tokenRes.ok) {
+    throw new Error(`Token exchange failed: HTTP ${tokenRes.status} ${JSON.stringify(tokenJson)}`);
+  }
+  if (!tokenJson.scope || !tokenJson.scope.split(' ').includes('atproto')) {
+    throw new Error(`Token response missing required "atproto" scope: ${JSON.stringify(tokenJson.scope)}`);
+  }
+  if (tokenJson.sub && tokenJson.sub !== pending.did) {
+    throw new Error(`Token sub (${tokenJson.sub}) does not match expected DID (${pending.did})`);
+  }
+
+  saveProfile(profile, {
+    did: pending.did,
+    pds: pending.pds,
+    authServer: pending.authServer,
+    tokenEndpoint: pending.tokenEndpoint,
+    revocationEndpoint: pending.revocationEndpoint,
+    clientId: pending.clientId,
+    redirectUri: pending.redirectUri,
+    scope: tokenJson.scope,
+    dpopKeys: pending.dpopKeys,
+    nonces: pending.nonces,
+    accessToken: tokenJson.access_token,
+    refreshToken: tokenJson.refresh_token,
+    tokenType: tokenJson.token_type,
+    obtainedAt: Date.now(),
+    expiresIn: tokenJson.expires_in || null,
+  });
+
+  fs.unlinkSync(pendingPath);
+  log(`Saved credentials to ${STORE_DIR}/${profile}.json`);
+  console.log(`\nLogged in as ${pending.did}`);
+}
+
 function cmdLogout(args) {
   const profile = args.profile || 'default';
   deleteProfile(profile);
@@ -359,6 +517,8 @@ async function main() {
       return cmdRefresh(args);
     case 'call':
       return cmdCall(args);
+    case 'complete-login':
+      return cmdCompleteLogin(args);
     case 'logout':
       return cmdLogout(args);
     case 'list':

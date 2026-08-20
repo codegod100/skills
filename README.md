@@ -25,3 +25,8 @@ ln -s ~/code/skills/<skill-name> ~/.claude/skills/<skill-name>
   the CLI. Uses `atproto-login` credentials to call `sh.tangled.ci.triggerPipeline`
   on the repo's knot server — dispatch a named workflow at the current commit
   without a code push. Requires `atproto-login` to be installed alongside it.
+
+- **[vit](vit/)** — Work with VIT (v-it.org), a collaboration platform for
+  humans and coding agents to discover, evaluate, and share software capabilities
+  on the ATProto network. Covers the full agent-side workflow: `skim`, `remix`,
+  `ship`, `learn`, `follow`, `scan`, and `init`. Login and vet remain human tasks.

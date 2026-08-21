@@ -187,6 +187,32 @@ time buck2 build //:some-real-target -c build.execution_platforms=root//platform
 # ^ if this shows `cached: N > 0` and is dramatically faster, caching is real.
 ```
 
+## If routing is fixed and hits are STILL 0%
+
+Fixing the `target_platform_detector_spec` gotcha above is necessary but may
+not be sufficient. After confirming via `what-ran` that every real compile
+action is correctly landing on the cache platform, run the rigorous two-pass
+test (same paragraph above) one more time. If it's *still* 0% hits on both
+passes — same machine, same config, `buck-out` wiped clean between passes,
+routing confirmed correct — that's no longer a config problem reachable from
+buckconfig. It means either:
+
+- `allow_cache_uploads` isn't actually writing ActionCache entries for
+  locally-executed actions in your buck2 version (as opposed to
+  `remote_enabled` actions, which write as a side effect of running on an RE
+  worker) — `--write-to-cache-anyway` looked like it might be the fix for
+  this but it's explicitly documented as requiring `--no-remote-cache`
+  (i.e. it's for the RE-worker-execution case, not pure local exec), so it
+  doesn't apply here.
+- Or action digests aren't actually reproducible between two nominally
+  identical local invocations (e.g. something machine/invocation-specific
+  leaking into the command line or env that gets hashed).
+
+Both require reading buck2's own source to confirm — not diagnosable purely
+from the client CLI/config surface. Don't burn more time re-testing routing
+once it's confirmed correct in `what-ran`; the remaining gap is a different,
+deeper question.
+
 ## Useful diagnostic commands
 
 - `buck2 log what-ran --recent 0` — every action from the last build, with

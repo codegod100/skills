@@ -187,31 +187,77 @@ time buck2 build //:some-real-target -c build.execution_platforms=root//platform
 # ^ if this shows `cached: N > 0` and is dramatically faster, caching is real.
 ```
 
-## If routing is fixed and hits are STILL 0%
+## The third lever: if routing is fixed and hits are STILL 0%
 
-Fixing the `target_platform_detector_spec` gotcha above is necessary but may
-not be sufficient. After confirming via `what-ran` that every real compile
-action is correctly landing on the cache platform, run the rigorous two-pass
-test (same paragraph above) one more time. If it's *still* 0% hits on both
-passes — same machine, same config, `buck-out` wiped clean between passes,
-routing confirmed correct — that's no longer a config problem reachable from
-buckconfig. It means either:
+Fixing the `target_platform_detector_spec` gotcha above is necessary but is
+**not** sufficient. There is a third, completely separate config key, and
+missing it produces a very specific, misleading symptom: uploads that
+*look* like they're happening (real MiB of "up" traffic, `[upload (action)]`
+markers in `buck2 build`'s live status line) while the *next* build still
+gets 0% cache hits. The giveaway, in hindsight: on the broken run the "up"
+traffic was suspiciously tiny (~365KiB for 1708 actions — just RE session
+bookkeeping) even though `allow_cache_uploads = True` was set on the
+execution platform. That's the tell that uploads were never actually being
+*attempted*, not that they were attempted and silently failed.
 
-- `allow_cache_uploads` isn't actually writing ActionCache entries for
-  locally-executed actions in your buck2 version (as opposed to
-  `remote_enabled` actions, which write as a side effect of running on an RE
-  worker) — `--write-to-cache-anyway` looked like it might be the fix for
-  this but it's explicitly documented as requiring `--no-remote-cache`
-  (i.e. it's for the RE-worker-execution case, not pure local exec), so it
-  doesn't apply here.
-- Or action digests aren't actually reproducible between two nominally
-  identical local invocations (e.g. something machine/invocation-specific
-  leaking into the command line or env that gets hashed).
+The root cause (found by reading buck2's own source —
+`gh search code <query> --repo facebook/buck2`, not the docs site, which
+doesn't cover this): every individual `RunAction` (i.e. every `rustc`
+invocation) carries its **own** `allow_cache_upload` flag, independent of the
+execution platform's `CommandExecutorConfig.allow_cache_uploads`:
 
-Both require reading buck2's own source to confirm — not diagnosable purely
-from the client CLI/config surface. Don't burn more time re-testing routing
-once it's confirmed correct in `what-ran`; the remaining gap is a different,
-deeper question.
+```rust
+// app/buck2_action_impl/src/actions/impls/run.rs
+&& (allow_cache_upload || supports_remote_dep_files || force_cache_upload()?)
+```
+
+When a rule's action doesn't pass this explicitly, it falls back to a knob
+that defaults to `false`:
+
+```rust
+// app/buck2_server/src/ctx.rs
+default_allow_cache_upload: false,
+run_action_knobs.default_allow_cache_upload |= root_config
+    .parse::<bool>(BuckconfigKeyRef { section: "buck2", property: "default_allow_cache_upload" })?
+    .unwrap_or(false);
+```
+
+Searching every `.bzl` file in the buck2 prelude for `allow_cache_upload`
+(`gh search code allow_cache_upload --repo facebook/buck2 --extension bzl`)
+shows Go, C++, Apple, and Android toolchain rules all wire it through
+explicitly from their own toolchain attrs on every real compile/link action.
+**`prelude/rust/*.bzl` never sets it, for any rustc action.** So a pure-Rust
+build silently eats the hardcoded `false` default no matter what
+`allow_cache_uploads` says on the execution platform — the two settings look
+like the same knob but are not.
+
+Fix: set the buckconfig key explicitly.
+
+```
+[buck2]
+  default_allow_cache_upload = true
+```
+
+Verified fix, same machine, clean `buck-out` both passes, real top-level
+build: pass 1 (cold, this key just added) 13m11s with genuine multi-hundred-
+MiB uploads (826MiB up); pass 2 (identical config) **8.3 seconds**,
+`Cache hits: 100%`, `Commands: 1708 (cached: 1708, remote: 0, local: 0)`.
+
+So getting BuildBuddy caching working for a buck2/Rust project needs all
+**three** independent levers together — missing any one produces a
+plausible-looking 0%-hits failure with a different signature each time:
+
+1. `[build] execution_platforms` — registers the cache-enabled platform.
+2. `[parser] target_platform_detector_spec` — routes toolchain-owned actions
+   (the Rust toolchain itself) onto it.
+3. `[buck2] default_allow_cache_upload` — opts individual actions into
+   upload, since the Rust prelude rules never do this per-action like other
+   language toolchains do.
+
+If hits are *still* 0% with all three set and routing confirmed via
+`what-ran`, that's genuinely uncharted territory — recheck action-digest
+reproducibility between runs (config-hash suffix in `what-ran`, see pitfall
+#3) before assuming it's another missing buckconfig key.
 
 ## Useful diagnostic commands
 

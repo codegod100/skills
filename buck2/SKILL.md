@@ -119,9 +119,23 @@ http_headers = x-buildbuddy-api-key:$BUILDBUDDY_API_KEY
 `$VAR` in `http_headers` is substituted from the **shell environment at
 invocation time** — if the var isn't set, the build **hard-fails** (does not
 silently fall back to local): `Error converting headers: Error substituting
-'$VAR': environment variable not found`. Make sure whatever loads the env var
-(direnv, etc.) is actually hooked into the shell before relying on this in
-day-to-day use, not just in the terminal you tested it from.
+'$VAR': environment variable not found`. The substitution itself is nothing
+more than `std::env::var()` (`remote_execution/oss/re_grpc/src/client.rs`) —
+no file-reading, no default value, no direnv awareness of any kind.
+
+If this config lives in a file that's already gitignored and never committed
+(a machine-local `.buckconfig.local`, say), the `$VAR` indirection buys
+nothing — it's the same trust boundary as the literal value, but with an
+extra failure mode (build hard-fails whenever whatever's supposed to load the
+env var, e.g. direnv, isn't actually hooked into the current shell). In that
+case just put the real key directly in the gitignored file instead:
+
+```
+http_headers = x-buildbuddy-api-key:<the actual key>
+```
+
+Only reach for `$VAR` substitution when the config file itself is committed
+(shared across machines/CI) and the secret genuinely can't live in it.
 
 ## Verifying the server side directly, without a browser
 

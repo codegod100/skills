@@ -30,3 +30,10 @@ ln -s ~/code/skills/<skill-name> ~/.claude/skills/<skill-name>
   humans and coding agents to discover, evaluate, and share software capabilities
   on the ATProto network. Covers the full agent-side workflow: `skim`, `remix`,
   `ship`, `learn`, `follow`, `scan`, and `init`. Login and vet remain human tasks.
+
+- **[buck2](buck2/)** — Debugging and configuring buck2's execution-platform
+  routing and remote cache (REAPI / BuildBuddy) setup: the
+  `target_platform_detector_spec` vs `execution_platforms` gotcha, cache-only
+  vs remote-execution tradeoffs for non-hermetic toolchains, and the testing
+  pitfalls (`buck-out` staleness, config-hash mismatches) that produce false
+  "0% cache hits" readings.
